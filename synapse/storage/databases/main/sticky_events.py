@@ -29,6 +29,7 @@ from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.state import StateGroupWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
 from synapse.storage.util.id_generators import MultiWriterIdGenerator
+from synapse.types import RoomID
 from synapse.util.duration import Duration
 
 if TYPE_CHECKING:
@@ -410,4 +411,94 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         return self.hs.run_as_background_process(
             "delete_expired_sticky_events",
             self._delete_expired_sticky_events,
+        )
+
+    async def get_backlogged_sticky_events_for_destination(
+        self, destination: str, *, limit: int = 50
+    ) -> tuple[RoomID, list[str]] | None:
+        """
+        From the `destination_room_sticky_events_backlog` table, if there are backlogged
+        sticky events to send to the given destination, returns up to 50 IDs of sticky
+        events from one room.
+
+        The sticky events are ordered by oldest stream_ordering first.
+
+        Returns `None` if there are no sticky events in the backlog for this destination.
+        """
+
+        def _clean_backlog_txn(txn: LoggingTransaction) -> None:
+            """
+            Clean up `destination_room_sticky_events_backlog` rows that no longer apply,
+            because there are no longer active sticky events in that range in that room.
+
+            Invoked when we try to process a room and find that it has no sticky events
+            to send to this destination.
+            """
+            txn.execute(
+                """
+                WITH to_clean_up AS (
+                    SELECT room_id FROM destination_room_sticky_events_backlog backlog
+                    -- This is an anti-join: we want to find backlog rows where no sticky events match
+                    LEFT JOIN sticky_events se
+                        ON se.room_id = backlog.room_id
+                        AND se.event_stream_ordering > backlog.last_successful_event_stream_ordering
+                    WHERE se.event_id IS NULL
+                )
+                DELETE FROM destination_room_sticky_events_backlog
+                WHERE destination = ? AND room_id IN (SELECT room_id FROM to_clean_up)
+                """
+            )
+
+        def _try_get_backlogged_sticky_events_for_destination_txn(
+            txn: LoggingTransaction,
+        ) -> tuple[RoomID, list[str]] | None:
+            txn.execute(
+                """
+                SELECT room_id, sticky_events_stream_position
+                FROM destination_room_sticky_events_backlog
+                WHERE destination = ?
+                LIMIT 1
+                """
+            )
+            row = txn.fetchone()
+            if not row:
+                return None
+
+            room_id, last_sent_sticky_event_stream_ordering = cast(tuple[str, int], row)
+
+            # FILLME
+            txn.execute(
+                """
+                SELECT event_id
+                FROM sticky_events
+                WHERE room_id = ? AND ? < event_stream_ordering
+                ORDER BY event_stream_ordering ASC
+                LIMIT ?
+                """,
+                (room_id, last_sent_sticky_event_stream_ordering, limit),
+            )
+            return RoomID.from_string(room_id), [event_id for (event_id,) in txn]
+
+        def _get_backlogged_sticky_events_for_destination_txn(
+            txn: LoggingTransaction,
+        ) -> tuple[RoomID, list[str]] | None:
+            answer = _try_get_backlogged_sticky_events_for_destination_txn(txn)
+            if answer is None:
+                return None
+
+            room_id, sticky_events = answer
+            if sticky_events:
+                return room_id, sticky_events
+
+            # A room is considered backlogged but doesn't have any
+            # sticky events to send
+            # This can happen when the sticky events expire, for instance.
+            # Trigger a cleanup of the table for this destination and try round again.
+            _clean_backlog_txn(txn)
+
+            return _try_get_backlogged_sticky_events_for_destination_txn(txn)
+
+        return await self.db_pool.runInteraction(
+            "get_backlogged_sticky_events_for_destination",
+            _get_backlogged_sticky_events_for_destination_txn,
         )

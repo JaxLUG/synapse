@@ -25,7 +25,7 @@
 -- Due to sticky event expiration and event deletion, rows in this table are
 -- hints that there *may* be sticky events to send, but not a guarantee that
 -- there actually are.
-CREATE TABLE destination_room_unsent_sticky_events (
+CREATE TABLE destination_room_sticky_events_backlog (
     -- Server name of the remote homeserver.
     destination TEXT NOT NULL,
 
@@ -45,6 +45,9 @@ CREATE TABLE destination_room_unsent_sticky_events (
     --
     -- Not a foreign key because we must still support expiration of sticky events.
     sticky_events_stream_position INTEGER NOT NULL,
+
+    -- TODO
+    last_successful_event_stream_ordering INTEGER NOT NULL,
 
     -- It's enough to track one position per (destination, room_id) pair.
     PRIMARY KEY (destination, room_id)
