@@ -24,6 +24,7 @@ from synapse.storage.database import (
     LoggingDatabaseConnection,
     LoggingTransaction,
     make_in_list_sql_clause,
+    user_is_local_like_pattern,
 )
 from synapse.storage.databases.main.cache import CacheInvalidationWorkerStore
 from synapse.storage.databases.main.state import StateGroupWorkerStore
@@ -421,7 +422,10 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
         sticky events to send to the given destination, returns up to 50 IDs of sticky
         events from one room.
 
-        The sticky events are ordered by oldest stream_ordering first.
+        The sticky events are constrained to originating from this server.
+        (TODO MSC ref)
+        The sticky events are ordered by oldest `sticky_events.stream_id` first,
+        which corresponds to `stream_ordering` first for locally-originating events.
 
         Returns `None` if there are no sticky events in the backlog for this destination.
         """
@@ -437,16 +441,23 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
             txn.execute(
                 """
                 WITH to_clean_up AS (
-                    SELECT room_id FROM destination_room_sticky_events_backlog backlog
+                    SELECT room_id FROM destination_room_sticky_events_backlog AS backlog
                     -- This is an anti-join: we want to find backlog rows where no sticky events match
-                    LEFT JOIN sticky_events se
+                    LEFT JOIN sticky_events AS se
                         ON se.room_id = backlog.room_id
-                        AND se.event_stream_ordering > backlog.last_successful_event_stream_ordering
+                        -- filter to locally-originating sticky events
+                        AND se.sender LIKE ?
+                        -- TODO >= vs > here! Need to figure out what we're doing and what looks cleanest
+                        AND se.stream_id >= backlog.sticky_events_stream_position
                     WHERE se.event_id IS NULL
                 )
                 DELETE FROM destination_room_sticky_events_backlog
                 WHERE destination = ? AND room_id IN (SELECT room_id FROM to_clean_up)
-                """
+                """,
+                # TODO add this helper in its own commit and deduplicate with other sites of this pattern
+                # "%:" + self.hs.hostname
+                # TODO fix up these params if needed
+                (user_is_local_like_pattern(self.hs), destination),
             )
 
         def _try_get_backlogged_sticky_events_for_destination_txn(
@@ -471,7 +482,11 @@ class StickyEventsWorkerStore(StateGroupWorkerStore, CacheInvalidationWorkerStor
                 """
                 SELECT event_id
                 FROM sticky_events
+                -- TODO change order to stream_id
+                -- TODO constrain to locally originating
                 WHERE room_id = ? AND ? < event_stream_ordering
+                    -- filter to locally-originating sticky events
+                    AND se.sender LIKE ?
                 ORDER BY event_stream_ordering ASC
                 LIMIT ?
                 """,
